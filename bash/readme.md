@@ -9,7 +9,7 @@ The official Bash client for **Script Beacon**, the telemetry layer for scripts.
 ### 1. Install
 
 ```bash
-curl -fsSL https://get.scriptbeacon.dev/beam.sh | bash
+curl -fsSL https://github.com/Bleepit/scriptbeacon-clients/blob/537ade9f9965af9de3432587449ea3bd477adf23/bash/install.sh | bash
 ```
 
 This installs the `beam` command into `/usr/local/bin`.

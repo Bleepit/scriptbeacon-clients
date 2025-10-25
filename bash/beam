@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Script Beacon — beam CLI (shebang + wrapper)  v0.3.0
+# Script Beacon — beam CLI (shebang + wrapper)  v0.3.1
 # Requires: bash 4+, curl, gzip; and either jq or python3 for small JSON parsing.
 
 set -uo pipefail
 
-BEAM_VERSION="0.3.0"
+BEAM_VERSION="0.3.1"
 
-# -------- Defaults / Env --------
 : "${SB_ID:=}"
 : "${SB_API:=https://api.scriptbeacon.com}"
 : "${SB_WRITE:=}"
@@ -28,7 +27,6 @@ SB_LAST_STATUS=""
 
 CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/scriptbeacon/config"
 
-# -------- Utilities --------
 have(){ command -v "$1" >/dev/null 2>&1; }
 have_jq(){ have jq; }
 have_py(){ have python3 || have python; }
@@ -45,14 +43,19 @@ sha256hex(){
 }
 strip_quotes(){ local v="$1"; v="${v%$'\r'}"; [[ "$v" =~ ^\".*\"$ || "$v" =~ ^\'.*\'$ ]] && v="${v:1:${#v}-2}"; printf '%s' "$v"; }
 
-# -------- JSON helpers --------
-jesc(){ # JSON-escape scalar as string
+# --- JSON helpers (no awk warnings) ---
+jesc(){ # JSON-escape scalar as a JSON string
+  if have_jq; then printf '%s' "$1" | jq -Rs .; return; fi
+  if have_py; then "$(py)" - <<'PY' 2>/dev/null
+import json,sys
+print(json.dumps(sys.stdin.read()))
+PY
+    return
+  fi
+  # minimal fallback: escape backslash and quotes, map newlines/tabs
   local s="$1"
-  printf '%s' "$s" | awk 'BEGIN{ORS="";print "\""}{
-    gsub(/\\/,"\\\\"); gsub(/\"/,"\\\"");
-    gsub(/\r/,"\\r"); gsub(/\n/,"\\n"); gsub(/\t/,"\\t");
-    printf "%s",$0
-  }END{print "\""}'
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+  printf '"%s"' "$s"
 }
 json_get(){ # json_get '<json>' '.path'
   local j="$1" p="$2"
@@ -89,6 +92,7 @@ pairs_to_json(){ # "a=1 b=2" or "a=1,b=2"
     [[ -z "$kv" ]] && continue
     local k="${kv%%=*}" v="${kv#*=}"; [[ "$k" == "$v" ]] && continue
     ((first)) || out+=", "; first=0
+    # shellcheck disable=SC2001
     out+="$(printf '%s' "$k" | sed 's/"/\\"/g')":$(jesc "$(strip_quotes "$v")")
   done; out+="}"
   printf '%s' "$out"
@@ -100,44 +104,51 @@ enrich_tags(){
   json_merge "$base" "$enrich"
 }
 
-# -------- Config file (safe parse) --------
+# --- Config ---
 load_config(){
   [[ -f "$CONFIG_PATH" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%%#*}"; line="$(printf '%s' "$line" | sed 's/[[:space:]]\+$//')"
     [[ -z "$line" ]] && continue
     case "$line" in
-      SB_ID=*|export\ SB_ID=*)     [[ -z "${SB_ID:-}" ]]    && SB_ID="$(strip_quotes "${line#*=}")" ;;
-      SB_API=*|export\ SB_API=*)   [[ -z "${SB_API:-}" ]]   && SB_API="$(strip_quotes "${line#*=}")" ;;
+      SB_ID=*|export\ SB_ID=*)       [[ -z "${SB_ID:-}" ]]    && SB_ID="$(strip_quotes "${line#*=}")" ;;
+      SB_API=*|export\ SB_API=*)     [[ -z "${SB_API:-}" ]]   && SB_API="$(strip_quotes "${line#*=}")" ;;
       SB_WRITE=*|export\ SB_WRITE=*) [[ -z "${SB_WRITE:-}" ]] && SB_WRITE="$(strip_quotes "${line#*=}")" ;;
-      SB_TAGS=*|export\ SB_TAGS=*) [[ -z "${SB_TAGS:-}" ]]  && SB_TAGS="$(strip_quotes "${line#*=}")" ;;
+      SB_TAGS=*|export\ SB_TAGS=*)   [[ -z "${SB_TAGS:-}" ]]  && SB_TAGS="$(strip_quotes "${line#*=}")" ;;
     esac
   done < "$CONFIG_PATH"
   SB_API_ROOT="${SB_API%/}"
 }
 
-# -------- Script header overrides (read before capture) --------
-load_script_overrides(){ # first ~100 lines
-  local script="$1" n=0 line
-  [[ -r "$script" ]] || return 0
+# --- Script header overrides (first ~100 lines) ---
+load_script_overrides(){
+  local script="${1-}" n=0 line
+  [[ -n "$script" && -r "$script" ]] || return 0
   while IFS= read -r line && (( n < 100 )); do
     ((n++))
     local raw="${line%%#*}"
     raw="$(printf '%s' "$raw" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     [[ -z "$raw" ]] && continue
     case "$raw" in
-      SB_ID=*|export\ SB_ID=*)     SB_ID="$(strip_quotes "${raw#*=}")" ;;
-      SB_API=*|export\ SB_API=*)   SB_API="$(strip_quotes "${raw#*=}")"; SB_API_ROOT="${SB_API%/}" ;;
+      SB_ID=*|export\ SB_ID=*)       SB_ID="$(strip_quotes "${raw#*=}")" ;;
+      SB_API=*|export\ SB_API=*)     SB_API="$(strip_quotes "${raw#*=}")"; SB_API_ROOT="${SB_API%/}" ;;
       SB_WRITE=*|export\ SB_WRITE=*) SB_WRITE="$(strip_quotes "${raw#*=}")" ;;
-      SB_TAGS=*|export\ SB_TAGS=*) SB_TAGS="$(strip_quotes "${raw#*=}")" ;;
+      SB_TAGS=*|export\ SB_TAGS=*)   SB_TAGS="$(strip_quotes "${raw#*=}")" ;;
       *) : ;;
     esac
   done < "$script"
 }
 
-# -------- HTTP --------
-post_json(){ # post_json /path body -> prints resp; sets SB_LAST_STATUS
-  local path="$1" body="$2" url="${SB_API_ROOT%/}${path}" hd out
+# --- HTTP (hardened) ---
+post_json(){ # args: /api_path  body_json
+  local api_path="${1-}" body="${2-}"
+  if [[ -z "$api_path" || -z "$body" ]]; then
+    echo "beam: post_json missing args" >&2
+    SB_LAST_STATUS="000"
+    echo "{}"
+    return 1
+  fi
+  local url="${SB_API_ROOT%/}${api_path}" hd out
   hd="$(tmpf)"; out="$(tmpf)"; SB_LAST_STATUS=""
   local cmd=(curl -sS -D "$hd" -o "$out" -w '%{http_code}' -X POST "$url"
              -H 'Accept: application/json' -H 'Content-Type: application/json'
@@ -149,14 +160,16 @@ post_json(){ # post_json /path body -> prints resp; sets SB_LAST_STATUS
   cat "$out"; rm -f "$out" "$hd"
 }
 put_presigned(){ # put_presigned url headers_json file -> prints ETag
-  local url="$1" hdrjson="$2" file="$3" hd; hd="$(tmpf)"; local hdrs=()
+  local url="${1-}" hdrjson="${2-}" file="${3-}" hd; hd="$(tmpf)"; local hdrs=()
+  if [[ -z "$url" || -z "$file" ]]; then echo ""; rm -f "$hd"; return 0; fi
   if have_jq; then
-    while IFS=$'\t' read -r k v; do hdrs+=(-H "$k: $v"); done < <(printf '%s' "$hdrjson" | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
+    while IFS=$'\t' read -r k v; do hdrs+=(-H "$k: $v"); done < <(printf '%s' "$hdrjson" | jq -r 'to_entries[]? | "\(.key)\t\(.value)"')
   elif have_py; then
     ("$(py)" - <<'PY' 2>/dev/null
 import json,sys
-d=json.load(sys.stdin)
-for k,v in d.items(): print(f"{k}\t{v}")
+try: d=json.load(sys.stdin)
+except: d={}
+for k,v in getattr(d,'items',lambda:[])(): print(f"{k}\t{v}")
 PY
 ) <<<"$hdrjson" | while IFS=$'\t' read -r k v; do hdrs+=(-H "$k: $v"); done
   fi
@@ -165,12 +178,11 @@ PY
   rm -f "$hd"
 }
 
-# -------- Capture & finalize --------
+# --- Capture & finalize ---
 begin_capture(){
   [[ -z "$SB_ID" ]] && { echo "beam: SB_ID is required (set in config, env, or script header)" >&2; exit 2; }
   SB_TRANSCRIPT="$(tmpf).log"; : > "$SB_TRANSCRIPT"
   SB_STARTED="$(iso_now)"
-  # redirect to tee
   exec 3>&1 4>&2
   exec > >(tee -a "$SB_TRANSCRIPT") 2> >(tee -a "$SB_TRANSCRIPT" >&2)
 }
@@ -265,7 +277,7 @@ JSON
   printf 'beam: uploaded %s bytes (sha256 %s) • exit=%s • run=%s\n' "$bytes" "${sha:0:8}…" "$EXIT_CODE" "$(strip_quotes "$SB_RUN_ID")" >&2
 }
 
-# -------- Traps --------
+# --- Traps ---
 on_err(){
   local ec="$?" ts cmd src st
   ts="$(iso_now)"; cmd="${BASH_COMMAND:-unknown}"
@@ -286,7 +298,7 @@ on_exit(){
   fi
 }
 
-# -------- Subcommands --------
+# --- Subcommands ---
 cmd_help(){
   cat <<'H'
 Script Beacon — beam CLI
@@ -306,38 +318,25 @@ Env vars:
   SB_ID, SB_API (default https://api.scriptbeacon.com), SB_WRITE, SB_TAGS
 H
 }
-
-cmd_init(){ # beam init --id UUID [--api URL]
-  local id="" api=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --id) id="$2"; shift 2;;
-      --api) api="$2"; shift 2;;
-      *) echo "beam init: unknown flag $1" >&2; return 2;;
-    esac
-  done
+cmd_init(){ local id="" api=""
+  while [[ $# -gt 0 ]]; do case "$1" in
+    --id) id="$2"; shift 2;;
+    --api) api="$2"; shift 2;;
+    *) echo "beam init: unknown flag $1" >&2; return 2;;
+  esac; done
   [[ -z "$id" ]] && { echo "beam init: --id is required" >&2; return 2; }
-  mkdir -p "$(dirname "$CONFIG_PATH")"
-  umask 077
-  {
-    echo "SB_ID=$id"
-    [[ -n "$api" ]] && echo "SB_API=$api"
-  } > "$CONFIG_PATH"
+  mkdir -p "$(dirname "$CONFIG_PATH")"; umask 077
+  { echo "SB_ID=$id"; [[ -n "$api" ]] && echo "SB_API=$api"; } > "$CONFIG_PATH"
   echo "Initialized: $CONFIG_PATH"
 }
-cmd_login(){ # beam login --write TOKEN
-  local tok=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --write|--write-secret) tok="$2"; shift 2;;
-      *) echo "beam login: unknown flag $1" >&2; return 2;;
-    esac
-  done
+cmd_login(){ local tok=""
+  while [[ $# -gt 0 ]]; do case "$1" in
+    --write|--write-secret) tok="$2"; shift 2;;
+    *) echo "beam login: unknown flag $1" >&2; return 2;;
+  esac; done
   [[ -z "$tok" ]] && { echo "beam login: --write is required" >&2; return 2; }
-  mkdir -p "$(dirname "$CONFIG_PATH")"
-  umask 077
+  mkdir -p "$(dirname "$CONFIG_PATH")"; umask 077
   [[ -f "$CONFIG_PATH" ]] || : > "$CONFIG_PATH"
-  # preserve existing lines except SB_WRITE
   grep -v '^[[:space:]]*SB_WRITE=' "$CONFIG_PATH" 2>/dev/null > "${CONFIG_PATH}.new" || true
   echo "SB_WRITE=$tok" >> "${CONFIG_PATH}.new"
   mv "${CONFIG_PATH}.new" "$CONFIG_PATH"
@@ -373,9 +372,9 @@ cmd_status(){
 }
 cmd_version(){ echo "$BEAM_VERSION"; }
 
-# -------- Main dispatcher --------
+# --- Main dispatcher ---
 main(){
-  # If invoked as interpreter with a script path:
+  # Interpreter mode
   if [[ $# -ge 1 && -f "$1" && "$1" != "--" ]]; then
     local script="$1"; shift
     export SB_WRAP_ACTIVE=1
@@ -384,13 +383,11 @@ main(){
     SB_TAGS_JSON="$(tags_arg_to_json "${SB_TAGS:-}")"
     trap 'on_err' ERR; trap 'on_exit' EXIT
     begin_capture
-    # run the script body under bash
     bash "$script" "$@"; EXIT_CODE=$?
     finish_capture; finalize_run; trap - ERR EXIT
     exit "$EXIT_CODE"
   fi
 
-  # Subcommands and wrapper mode parsing
   [[ $# -eq 0 ]] && { cmd_help; exit 2; }
   case "$1" in
     help|-h|--help) cmd_help; exit 0;;
@@ -406,7 +403,6 @@ main(){
     --tags) SB_TAGS="$2"; shift 2;;
   esac
 
-  # Wrapper mode requires `--` then command
   if [[ "${1:-}" == "--" ]]; then
     shift
     [[ $# -gt 0 ]] || { echo "beam: missing command after --" >&2; exit 2; }
@@ -420,7 +416,6 @@ main(){
     exit "$EXIT_CODE"
   fi
 
-  # Fallback: if first arg looks like a file, treat like interpreter
   if [[ -f "${1:-}" ]]; then
     local script="$1"; shift
     export SB_WRAP_ACTIVE=1
@@ -434,8 +429,8 @@ main(){
     exit "$EXIT_CODE"
   fi
 
-  # Otherwise, show help.
   cmd_help; exit 2
 }
-
 main "$@"
+BASH
+sudo chmod +x /usr/local/bin/beam

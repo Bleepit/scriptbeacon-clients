@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 PREFIX="${PREFIX:-/usr/local/bin}"
-URL="${URL:-https://example.cdn/scriptbeacon/beam}"  # replace with your CDN
+URL="${URL:-https://github.com/Bleepit/scriptbeacon-clients/blob/a8b0aa82a560bd83a244fbdd3d7c914c18232ac3/bash/beam}"
 tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
 echo "Downloading beam → $PREFIX/beam"
 curl -fsSL "$URL" -o "$tmp"

@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# Script Beacon — beam CLI (shebang + wrapper)  v0.3.0
+# Requires: bash 4+, curl, gzip; and either jq or python3 for small JSON parsing.
+
+set -uo pipefail
+
+BEAM_VERSION="0.3.0"
+
+# -------- Defaults / Env --------
+: "${SB_ID:=}"
+: "${SB_API:=https://api.scriptbeacon.com}"
+: "${SB_WRITE:=}"
+: "${SB_TAGS:=}"
+
+SB_API_ROOT="${SB_API%/}"
+SB_RUN_ID=""
+SB_UPLOAD_ID=""
+SB_OBJECT_KEY=""
+SB_TRANSCRIPT=""
+SB_CLEAN=""
+SB_GZ=""
+SB_STARTED=""
+SB_ENDED=""
+SB_FINALIZED=0
+SB_ERR_EPILOGUE=""
+SB_TAGS_JSON="{}"
+SB_LAST_STATUS=""
+
+CONFIG_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/scriptbeacon/config"
+
+# -------- Utilities --------
+have(){ command -v "$1" >/dev/null 2>&1; }
+have_jq(){ have jq; }
+have_py(){ have python3 || have python; }
+py(){ command -v python3 >/dev/null 2>&1 && echo python3 || echo python; }
+iso_now(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+ua(){ printf 'ScriptBeacon/%s (bash %s; %s)' "$BEAM_VERSION" "${BASH_VERSION:-unknown}" "$(uname -srm)"; }
+tmpf(){ mktemp -t "beam-$(date -u +%Y%m%d-%H%M%S)-$$.XXXXXXXX" 2>/dev/null || mktemp "/tmp/beam-$$.XXXXXXXX"; }
+hostn(){ hostname 2>/dev/null || uname -n; }
+usern(){ id -un 2>/dev/null || whoami 2>/dev/null || echo "unknown"; }
+shellv(){ printf 'bash-%s' "${BASH_VERSION:-unknown}"; }
+filesize(){ wc -c < "$1" | tr -d '[:space:]'; }
+sha256hex(){
+  if have sha256sum; then sha256sum "$1" | awk '{print $1}'; elif have shasum; then shasum -a 256 "$1" | awk '{print $1}'; elif have openssl; then openssl dgst -sha256 -r "$1" | awk '{print $1}'; else echo ""; fi
+}
+strip_quotes(){ local v="$1"; v="${v%$'\r'}"; [[ "$v" =~ ^\".*\"$ || "$v" =~ ^\'.*\'$ ]] && v="${v:1:${#v}-2}"; printf '%s' "$v"; }
+
+# -------- JSON helpers --------
+jesc(){ # JSON-escape scalar as string
+  local s="$1"
+  printf '%s' "$s" | awk 'BEGIN{ORS="";print "\""}{
+    gsub(/\\/,"\\\\"); gsub(/\"/,"\\\"");
+    gsub(/\r/,"\\r"); gsub(/\n/,"\\n"); gsub(/\t/,"\\t");
+    printf "%s",$0
+  }END{print "\""}'
+}
+json_get(){ # json_get '<json>' '.path'
+  local j="$1" p="$2"
+  if have_jq; then printf '%s' "$j" | jq -r -c "$p // empty"; return; fi
+  "$(py)" - "$p" <<'PY' 2>/dev/null || true
+import json,sys
+p=sys.argv[1]
+try: d=json.load(sys.stdin)
+except: sys.exit(0)
+def get(o, p):
+  cur=o
+  for part in p.strip('.').split('.'):
+    if not part: continue
+    if isinstance(cur,dict) and part in cur: cur=cur[part]
+    else: return None
+  return cur
+v=get(d,p)
+if isinstance(v,(dict,list)): print(json.dumps(v,separators=(',',':')))
+elif v is not None: print(v)
+PY
+}
+json_merge(){ # shallow merge a + b
+  local a="${1:-{}}"; local b="${2:-{}}"
+  if have_jq; then jq -c -n --argjson A "$a" --argjson B "$b" '$A + $B'; return; fi
+  "$(py)" - <<PY 2>/dev/null || echo '{"fallback_merge":true}'
+import json
+a=json.loads('''$a'''); b=json.loads('''$b'''); a.update(b)
+print(json.dumps(a,separators=(',',':')))
+PY
+}
+pairs_to_json(){ # "a=1 b=2" or "a=1,b=2"
+  local input="$*"; local IFS=', '; local out="{" first=1
+  for kv in $input; do
+    [[ -z "$kv" ]] && continue
+    local k="${kv%%=*}" v="${kv#*=}"; [[ "$k" == "$v" ]] && continue
+    ((first)) || out+=", "; first=0
+    out+="$(printf '%s' "$k" | sed 's/"/\\"/g')":$(jesc "$(strip_quotes "$v")")
+  done; out+="}"
+  printf '%s' "$out"
+}
+tags_arg_to_json(){ [[ -z "${1:-}" ]] && { echo "{}"; return; }; [[ "$1" =~ ^\{ ]] && printf '%s' "$1" || pairs_to_json "$1"; }
+enrich_tags(){
+  local base="${1:-{}}"
+  local enrich; enrich=$(printf '{"host":%s,"user":%s,"shell":%s}' "$(jesc "$(hostn)")" "$(jesc "$(usern)")" "$(jesc "$(shellv)")")
+  json_merge "$base" "$enrich"
+}
+
+# -------- Config file (safe parse) --------
+load_config(){
+  [[ -f "$CONFIG_PATH" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"; line="$(printf '%s' "$line" | sed 's/[[:space:]]\+$//')"
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      SB_ID=*|export\ SB_ID=*)     [[ -z "${SB_ID:-}" ]]    && SB_ID="$(strip_quotes "${line#*=}")" ;;
+      SB_API=*|export\ SB_API=*)   [[ -z "${SB_API:-}" ]]   && SB_API="$(strip_quotes "${line#*=}")" ;;
+      SB_WRITE=*|export\ SB_WRITE=*) [[ -z "${SB_WRITE:-}" ]] && SB_WRITE="$(strip_quotes "${line#*=}")" ;;
+      SB_TAGS=*|export\ SB_TAGS=*) [[ -z "${SB_TAGS:-}" ]]  && SB_TAGS="$(strip_quotes "${line#*=}")" ;;
+    esac
+  done < "$CONFIG_PATH"
+  SB_API_ROOT="${SB_API%/}"
+}
+
+# -------- Script header overrides (read before capture) --------
+load_script_overrides(){ # first ~100 lines
+  local script="$1" n=0 line
+  [[ -r "$script" ]] || return 0
+  while IFS= read -r line && (( n < 100 )); do
+    ((n++))
+    local raw="${line%%#*}"
+    raw="$(printf '%s' "$raw" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -z "$raw" ]] && continue
+    case "$raw" in
+      SB_ID=*|export\ SB_ID=*)     SB_ID="$(strip_quotes "${raw#*=}")" ;;
+      SB_API=*|export\ SB_API=*)   SB_API="$(strip_quotes "${raw#*=}")"; SB_API_ROOT="${SB_API%/}" ;;
+      SB_WRITE=*|export\ SB_WRITE=*) SB_WRITE="$(strip_quotes "${raw#*=}")" ;;
+      SB_TAGS=*|export\ SB_TAGS=*) SB_TAGS="$(strip_quotes "${raw#*=}")" ;;
+      *) : ;;
+    esac
+  done < "$script"
+}
+
+# -------- HTTP --------
+post_json(){ # post_json /path body -> prints resp; sets SB_LAST_STATUS
+  local path="$1" body="$2" url="${SB_API_ROOT%/}${path}" hd out
+  hd="$(tmpf)"; out="$(tmpf)"; SB_LAST_STATUS=""
+  local cmd=(curl -sS -D "$hd" -o "$out" -w '%{http_code}' -X POST "$url"
+             -H 'Accept: application/json' -H 'Content-Type: application/json'
+             -H "User-Agent: $(ua)")
+  [[ -n "$SB_WRITE" ]] && cmd+=(-H "X-Beacon-Write: $SB_WRITE" -H "X-Api-Key: $SB_WRITE" -H "Authorization: ApiKey $SB_WRITE")
+  cmd+=(-d "$body")
+  local code; code="$("${cmd[@]}")" || code=$?
+  [[ "$code" =~ ^[0-9]+$ ]] && SB_LAST_STATUS="$code" || SB_LAST_STATUS="000"
+  cat "$out"; rm -f "$out" "$hd"
+}
+put_presigned(){ # put_presigned url headers_json file -> prints ETag
+  local url="$1" hdrjson="$2" file="$3" hd; hd="$(tmpf)"; local hdrs=()
+  if have_jq; then
+    while IFS=$'\t' read -r k v; do hdrs+=(-H "$k: $v"); done < <(printf '%s' "$hdrjson" | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
+  elif have_py; then
+    ("$(py)" - <<'PY' 2>/dev/null
+import json,sys
+d=json.load(sys.stdin)
+for k,v in d.items(): print(f"{k}\t{v}")
+PY
+) <<<"$hdrjson" | while IFS=$'\t' read -r k v; do hdrs+=(-H "$k: $v"); done
+  fi
+  curl -sS -D "$hd" -o /dev/null -X PUT "$url" "${hdrs[@]}" --upload-file "$file" >/dev/null
+  grep -i '^ETag:' "$hd" | awk -F: '{print $2}' | tr -d ' \r"' || true
+  rm -f "$hd"
+}
+
+# -------- Capture & finalize --------
+begin_capture(){
+  [[ -z "$SB_ID" ]] && { echo "beam: SB_ID is required (set in config, env, or script header)" >&2; exit 2; }
+  SB_TRANSCRIPT="$(tmpf).log"; : > "$SB_TRANSCRIPT"
+  SB_STARTED="$(iso_now)"
+  # redirect to tee
+  exec 3>&1 4>&2
+  exec > >(tee -a "$SB_TRANSCRIPT") 2> >(tee -a "$SB_TRANSCRIPT" >&2)
+}
+finish_capture(){
+  exec 1>&3 2>&4; exec 3>&- 4>&-
+  SB_ENDED="$(iso_now)"
+  [[ -n "$SB_ERR_EPILOGUE" ]] && printf '\n%s\n' "$SB_ERR_EPILOGUE" >> "$SB_TRANSCRIPT"
+  SB_CLEAN="${SB_TRANSCRIPT%.log}.clean.log"; cp -f "$SB_TRANSCRIPT" "$SB_CLEAN"
+  SB_GZ="${SB_CLEAN}.gz"; gzip -c -n "$SB_CLEAN" > "$SB_GZ"
+}
+finalize_run(){
+  [[ "$SB_FINALIZED" -eq 1 ]] && return 0
+  local bytes sha etag init_path comp_path ingest_path
+  bytes="$(filesize "$SB_GZ")"; sha="$(sha256hex "$SB_GZ")"
+  init_path="/b/${SB_ID}/chunk-init"
+  comp_path="/b/${SB_ID}/chunk-complete"
+  ingest_path="/b/${SB_ID}"
+
+  # INIT
+  local init_body; init_body=$(printf '{"size_bytes":%s,"content_type":%s,"content_encoding":%s,"sha256_hex":%s}' \
+    "$bytes" "$(jesc 'text/plain; charset=utf-8')" "$(jesc 'gzip')" "$(jesc "$sha")")
+  local init_resp; init_resp="$(post_json "$init_path" "$init_body")"
+  local http="$SB_LAST_STATUS"
+  if [[ "$http" -ge 400 ]]; then
+    echo "beam: upload blocked at INIT (HTTP $http). Kept local log: $SB_CLEAN" >&2
+    SB_FINALIZED=1; return 0
+  fi
+
+  # unwrap
+  local upload_url headers
+  upload_url="$(json_get "$init_resp" '.data.upload_url')"; [[ -z "$upload_url" ]] && upload_url="$(json_get "$init_resp" '.upload_url')"
+  headers="$(json_get "$init_resp" '.data.required_headers')"; [[ -z "$headers" ]] && headers="$(json_get "$init_resp" '.required_headers')"
+  SB_RUN_ID="$(json_get "$init_resp" '.data.run_id')"; [[ -z "$SB_RUN_ID" ]] && SB_RUN_ID="$(json_get "$init_resp" '.run_id')"
+  SB_UPLOAD_ID="$(json_get "$init_resp" '.data.upload_id')"; [[ -z "$SB_UPLOAD_ID" ]] && SB_UPLOAD_ID="$SB_RUN_ID"
+  SB_OBJECT_KEY="$(json_get "$init_resp" '.data.object_key')"; [[ -z "$SB_OBJECT_KEY" ]] && SB_OBJECT_KEY="$(json_get "$init_resp" '.object_key')"
+
+  # PUT
+  etag="$(put_presigned "$upload_url" "${headers:-{}}" "$SB_GZ")"
+
+  # COMPLETE (fallback if needed)
+  local merged_tags; merged_tags="$(enrich_tags "$(tags_arg_to_json "$SB_TAGS")")"
+  local complete_body; complete_body=$(cat <<JSON
+{
+  "run_id": $(jesc "$SB_RUN_ID"),
+  "upload_id": $(jesc "$SB_UPLOAD_ID"),
+  "session_id": $(jesc "$SB_UPLOAD_ID"),
+  "id": $(jesc "$SB_RUN_ID"),
+  "bytes": $bytes,
+  "size_bytes": $bytes,
+  "etag": $(jesc "$etag"),
+  "sha256_hex": $(jesc "$sha"),
+  "started_at": $(jesc "$SB_STARTED"),
+  "ended_at": $(jesc "$SB_ENDED"),
+  "exit_code": $EXIT_CODE,
+  "content_type": $(jesc 'text/plain; charset=utf-8'),
+  "content_encoding": $(jesc 'gzip'),
+  "tags": $merged_tags
+  $( [[ -n "$SB_OBJECT_KEY" ]] && printf ', "object_key": %s, "blob_key": %s, "key": %s' "$(jesc "$SB_OBJECT_KEY")" "$(jesc "$SB_OBJECT_KEY")" "$(jesc "$SB_OBJECT_KEY")" )
+}
+JSON
+)
+  post_json "$comp_path" "$complete_body" >/dev/null
+  http="$SB_LAST_STATUS"
+  if [[ "$http" -ge 400 ]]; then
+    if [[ "$http" == "404" || "$http" == "405" || "$http" == "410" ]]; then
+      local meta; meta=$(cat <<JSON
+{
+  "kind":"run_complete",
+  "run_id":$(jesc "$SB_RUN_ID"),
+  "upload_id":$(jesc "$SB_UPLOAD_ID"),
+  "object_key":$(jesc "$SB_OBJECT_KEY"),
+  "bytes":$bytes,
+  "etag":$(jesc "$etag"),
+  "sha256_hex":$(jesc "$sha"),
+  "started_at":$(jesc "$SB_STARTED"),
+  "ended_at":$(jesc "$SB_ENDED"),
+  "exit_code":$EXIT_CODE,
+  "content_type":$(jesc 'text/plain; charset=utf-8'),
+  "content_encoding":$(jesc 'gzip'),
+  "tags":$merged_tags,
+  "note":"fallback: chunk-complete not available"
+}
+JSON
+)
+      post_json "$ingest_path" "$meta" >/dev/null
+    else
+      echo "beam: finalize blocked (HTTP $http). Kept local log: $SB_CLEAN" >&2
+    fi
+  fi
+
+  SB_FINALIZED=1
+  printf 'beam: uploaded %s bytes (sha256 %s) • exit=%s • run=%s\n' "$bytes" "${sha:0:8}…" "$EXIT_CODE" "$(strip_quotes "$SB_RUN_ID")" >&2
+}
+
+# -------- Traps --------
+on_err(){
+  local ec="$?" ts cmd src st
+  ts="$(iso_now)"; cmd="${BASH_COMMAND:-unknown}"
+  src="${BASH_SOURCE[1]:-?}:${BASH_LINENO[0]:-?}"
+  st="$(caller 0 2>/dev/null; caller 1 2>/dev/null; caller 2 2>/dev/null)"
+  SB_ERR_EPILOGUE=$'\n'"──── TerminatingError() ─────────────────────────────────────────"$'\n'
+  SB_ERR_EPILOGUE+="Timestamp: ${ts}"$'\n'
+  SB_ERR_EPILOGUE+="ExitCode : ${ec}"$'\n'
+  SB_ERR_EPILOGUE+="Command  : ${cmd}"$'\n'
+  SB_ERR_EPILOGUE+="Location : ${src}"$'\n'
+  [[ -n "$st" ]] && SB_ERR_EPILOGUE+=$'Stack    :\n'"$st"$'\n'
+  return "$ec"
+}
+on_exit(){
+  if [[ "$SB_FINALIZED" -eq 0 && -n "${SB_TRANSCRIPT:-}" && -f "$SB_TRANSCRIPT" ]]; then
+    finish_capture
+    finalize_run || true
+  fi
+}
+
+# -------- Subcommands --------
+cmd_help(){
+  cat <<'H'
+Script Beacon — beam CLI
+
+Usage:
+  As shebang:  #!/usr/bin/env beam    (put at top of your script)
+  Wrapper:     beam [--id UUID] [--api URL] [--write-secret TOKEN] [--tags JSON_OR_KV] -- <command> [args...]
+  Subcommands: beam init --id UUID [--api URL]
+               beam login --write TOKEN
+               beam verify
+               beam doctor
+               beam status
+               beam version
+               beam help
+
+Env vars:
+  SB_ID, SB_API (default https://api.scriptbeacon.com), SB_WRITE, SB_TAGS
+H
+}
+
+cmd_init(){ # beam init --id UUID [--api URL]
+  local id="" api=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id) id="$2"; shift 2;;
+      --api) api="$2"; shift 2;;
+      *) echo "beam init: unknown flag $1" >&2; return 2;;
+    esac
+  done
+  [[ -z "$id" ]] && { echo "beam init: --id is required" >&2; return 2; }
+  mkdir -p "$(dirname "$CONFIG_PATH")"
+  umask 077
+  {
+    echo "SB_ID=$id"
+    [[ -n "$api" ]] && echo "SB_API=$api"
+  } > "$CONFIG_PATH"
+  echo "Initialized: $CONFIG_PATH"
+}
+cmd_login(){ # beam login --write TOKEN
+  local tok=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --write|--write-secret) tok="$2"; shift 2;;
+      *) echo "beam login: unknown flag $1" >&2; return 2;;
+    esac
+  done
+  [[ -z "$tok" ]] && { echo "beam login: --write is required" >&2; return 2; }
+  mkdir -p "$(dirname "$CONFIG_PATH")"
+  umask 077
+  [[ -f "$CONFIG_PATH" ]] || : > "$CONFIG_PATH"
+  # preserve existing lines except SB_WRITE
+  grep -v '^[[:space:]]*SB_WRITE=' "$CONFIG_PATH" 2>/dev/null > "${CONFIG_PATH}.new" || true
+  echo "SB_WRITE=$tok" >> "${CONFIG_PATH}.new"
+  mv "${CONFIG_PATH}.new" "$CONFIG_PATH"
+  echo "Saved write token in: $CONFIG_PATH"
+}
+cmd_verify(){
+  load_config
+  [[ -z "$SB_ID" ]] && { echo "beam verify: set SB_ID via 'beam init --id …' or env" >&2; return 2; }
+  export SB_TAGS="${SB_TAGS:-verify=true}"
+  trap 'on_err' ERR; trap 'on_exit' EXIT
+  begin_capture
+  echo "Script Beacon verify: $(date -u)"; echo "host=$(hostn) user=$(usern) shell=$(shellv)"
+  EXIT_CODE=0
+  finish_capture; finalize_run; trap - ERR EXIT
+  [[ "$SB_LAST_STATUS" =~ ^2 ]] && echo "✅ Verify OK (run $(strip_quotes "$SB_RUN_ID"))" || echo "⚠️ Verify sent with warnings (run $(strip_quotes "$SB_RUN_ID"))"
+}
+cmd_doctor(){
+  echo "Checking dependencies…"
+  for b in curl gzip; do have "$b" && echo "  • $b: OK" || echo "  • $b: MISSING"; done
+  if have_jq || have_py; then echo "  • JSON parser: OK"; else echo "  • JSON parser: missing (jq or python recommended)"; fi
+  echo "Config file: ${CONFIG_PATH} $([[ -f "$CONFIG_PATH" ]] && echo '(present)' || echo '(absent)')"
+  echo "SB_API: ${SB_API_ROOT}"
+}
+cmd_status(){
+  load_config
+  printf '{'
+  printf '"version":%s,' "$(jesc "$BEAM_VERSION")"
+  printf '"id":%s,' "$(jesc "${SB_ID:-}")"
+  printf '"api":%s,' "$(jesc "$SB_API_ROOT")"
+  printf '"write_present":%s,' "$([[ -n "${SB_WRITE:-}" ]] && echo true || echo false)"
+  printf '"config_path":%s' "$(jesc "$CONFIG_PATH")"
+  printf '}\n'
+}
+cmd_version(){ echo "$BEAM_VERSION"; }
+
+# -------- Main dispatcher --------
+main(){
+  # If invoked as interpreter with a script path:
+  if [[ $# -ge 1 && -f "$1" && "$1" != "--" ]]; then
+    local script="$1"; shift
+    export SB_WRAP_ACTIVE=1
+    load_config
+    load_script_overrides "$script"
+    SB_TAGS_JSON="$(tags_arg_to_json "${SB_TAGS:-}")"
+    trap 'on_err' ERR; trap 'on_exit' EXIT
+    begin_capture
+    # run the script body under bash
+    bash "$script" "$@"; EXIT_CODE=$?
+    finish_capture; finalize_run; trap - ERR EXIT
+    exit "$EXIT_CODE"
+  fi
+
+  # Subcommands and wrapper mode parsing
+  [[ $# -eq 0 ]] && { cmd_help; exit 2; }
+  case "$1" in
+    help|-h|--help) cmd_help; exit 0;;
+    version|--version) cmd_version; exit 0;;
+    status) shift; cmd_status "$@"; exit $?;;
+    doctor) shift; cmd_doctor "$@"; exit $?;;
+    init) shift; cmd_init "$@"; exit $?;;
+    login) shift; cmd_login "$@"; exit $?;;
+    verify) shift; cmd_verify "$@"; exit $?;;
+    --id) SB_ID="$2"; shift 2;;
+    --api) SB_API_ROOT="${2%/}"; shift 2;;
+    --write-secret|--write) SB_WRITE="$2"; shift 2;;
+    --tags) SB_TAGS="$2"; shift 2;;
+  esac
+
+  # Wrapper mode requires `--` then command
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+    [[ $# -gt 0 ]] || { echo "beam: missing command after --" >&2; exit 2; }
+    export SB_WRAP_ACTIVE=1
+    load_config
+    SB_TAGS_JSON="$(tags_arg_to_json "${SB_TAGS:-}")"
+    trap 'on_err' ERR; trap 'on_exit' EXIT
+    begin_capture
+    "$@"; EXIT_CODE=$?
+    finish_capture; finalize_run; trap - ERR EXIT
+    exit "$EXIT_CODE"
+  fi
+
+  # Fallback: if first arg looks like a file, treat like interpreter
+  if [[ -f "${1:-}" ]]; then
+    local script="$1"; shift
+    export SB_WRAP_ACTIVE=1
+    load_config
+    load_script_overrides "$script"
+    SB_TAGS_JSON="$(tags_arg_to_json "${SB_TAGS:-}")"
+    trap 'on_err' ERR; trap 'on_exit' EXIT
+    begin_capture
+    bash "$script" "$@"; EXIT_CODE=$?
+    finish_capture; finalize_run; trap - ERR EXIT
+    exit "$EXIT_CODE"
+  fi
+
+  # Otherwise, show help.
+  cmd_help; exit 2
+}
+
+main "$@"
